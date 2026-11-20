@@ -14,7 +14,7 @@ Open [ECHO on localhost](http://127.0.0.1:8000). After setup, run **.\start.ps1*
 
 ## Try the demo
 
-For a phone on the same trusted Wi-Fi, run `ipconfig` on the PC and use the Wi-Fi adapter's IPv4 address with `.\.venv\Scripts\python.exe -m echo.phone 192.0.2.10` (replace the example address with yours). Open the printed HTTP URL on the phone and use the username and temporary password printed in the PC terminal. The phone gateway listens on port 8001. After passing the gateway, create or sign in to your own ECHO account. Use the same personal account on your PC and phone to open your archive on both devices. Each person should create a separate account and sign out through Settings on a shared device. Keep the terminal open during testing. Ctrl+C ends phone access.
+To test from another device, follow the [phone setup and port guide](docs/phone.md).
 
 1. Sign in or select **Create an account**, then select **Load sample archive** on Search or Settings.
 2. Try **How can I remember what I study for longer?** Open a result to see the passage that matched.
