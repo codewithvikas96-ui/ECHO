@@ -51,6 +51,13 @@ class PrivateArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await bob.get("/api/sources")).json(), [])
         for method, url in (("GET", path), ("GET", path + "/original"), ("DELETE", path)):
             self.assertEqual((await bob.request(method, url)).status_code, 404)
+        # Both databases assign the same first ID. Each request must still use its own archive.
+        other_file = b"Library opening hours"
+        uploaded = await bob.post("/api/sources/import", files={"file": ("schedule.txt", other_file)})
+        self.assertEqual(uploaded.json()["id"], source_id)
+        self.assertEqual((await bob.get(path + "/original")).content, other_file)
+        self.assertEqual((await bob.delete(path)).status_code, 204)
+        self.assertEqual((await alice.get(path + "/original")).content, file["file"][1])
         for mode in ("contextual", "semantic", "keyword"):
             query = {"query": "Alpine glacier field notes", "mode": mode}
             self.assertEqual((await anonymous.post("/api/search", json=query)).status_code, 401)
