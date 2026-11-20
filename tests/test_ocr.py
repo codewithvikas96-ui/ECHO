@@ -3,7 +3,22 @@ import unittest
 
 from PIL import Image, ImageDraw, ImageFont
 
-from echo.ocr import extract_image, find_tesseract
+from echo.ocr import extract_image, find_tesseract, grayscale
+
+
+class PhonePhotoTests(unittest.TestCase):
+    def test_jpeg_camera_orientation_applied_before_recognition(self):
+        # The camera stored a vertical stripe at the left. EXIF asks for a clockwise turn.
+        photo = Image.new("L", (80, 40), "white")
+        ImageDraw.Draw(photo).rectangle((0, 0, 19, 39), fill="black")
+        metadata = Image.Exif()
+        metadata[274] = 6
+        data = BytesIO()
+        photo.save(data, format="JPEG", exif=metadata)
+        upright = grayscale(data.getvalue())
+        self.assertEqual(upright.size, (40, 80))
+        self.assertLess(upright.getpixel((20, 10)), 10)
+        self.assertGreater(upright.getpixel((20, 70)), 245)
 
 
 @unittest.skipUnless(find_tesseract(), "local Tesseract engine required")
