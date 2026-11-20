@@ -42,4 +42,4 @@ To run the benchmark without the browser, use **.\.venv\Scripts\python.exe -m ec
 
 The dashboard artwork was made with the built-in ImageGen tool from a prompt for an electric-cobalt sculpture of concentric grooves, viewed at an angle against a deep indigo backdrop.
 
-For the API isolation tests, install the test client with `python -m pip install "httpx>=0.27,<0.29"` in the project environment, then run `python -m unittest discover -s tests`.
+After first-time setup, install the test dependencies with `.\.venv\Scripts\python.exe -m pip install -r requirements-test.txt`, then run `.\.venv\Scripts\python.exe -m unittest discover -s tests -v`.
