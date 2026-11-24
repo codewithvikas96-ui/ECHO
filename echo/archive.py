@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS chunks (
     vector BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chunks_source ON chunks(source_id, id);
+CREATE TABLE IF NOT EXISTS title_vectors (
+    source_id INTEGER PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+    vector BLOB NOT NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS keywords USING fts5(title, body, tokenize='porter unicode61');
 CREATE TABLE IF NOT EXISTS catalog (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL);
 INSERT OR IGNORE INTO catalog VALUES (1, 0);
@@ -155,7 +159,7 @@ class Archive:
             existing = db.execute("SELECT id FROM sources WHERE fingerprint=?", (key,)).fetchone()
         if existing:
             return existing["id"], False
-        vectors = model.encode([text for _, text in chunks])
+        vectors = model.encode([text for _, text in chunks] + [document.title])
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT id FROM sources WHERE fingerprint=?", (key,)).fetchone()
@@ -181,7 +185,10 @@ class Archive:
                 """, (title, document.kind, document.url, document.filename, document.original,
                       (source_date or date.today()).isoformat(), datetime.now(timezone.utc).isoformat(), key, sample_key))
                 source_id = source.lastrowid
-            for (page, text), vector in zip(chunks, vectors, strict=True):
+            if title == document.title:
+                db.execute("INSERT OR REPLACE INTO title_vectors VALUES (?,?)",
+                           (source_id, vectors[-1].astype("<f4", copy=False).tobytes()))
+            for (page, text), vector in zip(chunks, vectors[:-1], strict=True):
                 chunk = db.execute(
                     "INSERT INTO chunks (source_id,page,text,vector) VALUES (?,?,?,?)",
                     (source_id, page, text, vector.astype("<f4", copy=False).tobytes()),
@@ -198,23 +205,53 @@ class Archive:
                 db.execute("UPDATE catalog SET revision=revision+1")
         return bool(deleted)
 
-    def _semantic_scores(self, db, rows, query_vector) -> dict[int, float]:
+    def _index_missing_titles(self):
+        # Older archives only have passage vectors. Encode in batches outside the write transaction.
+        with self.connect() as db:
+            while missing := db.execute("""
+                SELECT s.id, s.title FROM sources s LEFT JOIN title_vectors t ON t.source_id=s.id
+                WHERE t.source_id IS NULL ORDER BY s.id LIMIT 64
+            """).fetchall():
+                vectors = self.get_model().encode([row["title"] for row in missing])
+                with db:
+                    for row, vector in zip(missing, vectors, strict=True):
+                        db.execute("""
+                            INSERT OR IGNORE INTO title_vectors (source_id, vector)
+                            SELECT id, ? FROM sources WHERE id=? AND title=?
+                        """, (vector.astype("<f4", copy=False).tobytes(), row["id"], row["title"]))
+                    db.execute("UPDATE catalog SET revision=revision+1")
+
+    def _semantic_scores(self, db, rows, query_vector) -> tuple[dict[int, float], set[int]]:
         faiss.omp_set_num_threads(2)
         revision = db.execute("SELECT revision FROM catalog WHERE id=1").fetchone()[0]
         with self._index_lock:
             if revision != self._revision:
                 index = faiss.IndexIDMap(faiss.IndexFlatIP(DIMENSIONS))
-                vectors = list(db.execute("SELECT id, vector FROM chunks ORDER BY id"))
+                # Positive IDs identify passages. Title IDs are negative and avoid FAISS's -1 sentinel.
+                vectors = list(db.execute("""
+                    SELECT id, vector FROM chunks
+                    UNION ALL SELECT -source_id-1 AS id, vector FROM title_vectors
+                """))
                 if vectors:
                     ids = np.array([row["id"] for row in vectors], dtype=np.int64)
                     matrix = np.stack([np.frombuffer(row["vector"], dtype="<f4") for row in vectors])
                     index.add_with_ids(np.ascontiguousarray(matrix, dtype=np.float32), ids)
                 self._revision, self._index = revision, index
             if not self._index.ntotal:
-                return {}
+                return {}, set()
             scores, ids = self._index.search(query_vector, self._index.ntotal)
-        eligible = {row["chunk_id"] for row in rows}
-        return {int(chunk_id): float(score) for chunk_id, score in zip(ids[0], scores[0]) if chunk_id in eligible}
+        similarities = dict(zip(ids[0].tolist(), scores[0].tolist()))
+        combined = {}
+        title_led = set()
+        for row in rows:
+            passage = similarities[row["chunk_id"]]
+            title = similarities.get(-row["id"] - 1, 0.0)
+            # A descriptive title can recover a generic passage. Passage evidence still picks
+            # the excerpt when multiple chunks share that title.
+            combined[row["chunk_id"]] = max(passage, 0.8 * title + 0.2 * passage)
+            if combined[row["chunk_id"]] > passage:
+                title_led.add(row["chunk_id"])
+        return combined, title_led
 
     def search(self, query: str, mode: str, kinds=(), date_from=None, date_to=None, top_k=8) -> list[dict]:
         topic = TOPIC_PREFIX.sub("", query.strip()).strip() or query
@@ -236,6 +273,8 @@ class Archive:
         if date_to:
             filters.append("s.source_date <= ?")
             params.append(str(date_to))
+        if mode != "keyword":
+            self._index_missing_titles()
         with self.connect() as db:
             db.execute("BEGIN")
             rows = list(db.execute(f"""
@@ -257,8 +296,9 @@ class Archive:
                     )
                 }
             semantic = {}
+            title_led = set()
             if mode != "keyword":
-                semantic = self._semantic_scores(db, rows, self.get_model().encode([topic]))
+                semantic, title_led = self._semantic_scores(db, rows, self.get_model().encode([topic]))
         minimum_similarity = TOPIC_MIN_SIMILARITY if short_topic else DESCRIPTION_MIN_SIMILARITY
         # Keep weak tail results out even when one source strongly matches the query.
         minimum_similarity = max(minimum_similarity, max(semantic.values(), default=0.0) - 0.22)
@@ -278,7 +318,7 @@ class Archive:
                 fields = [f" {value} " for value in (normalized_words(row["text"]), title, filename)]
                 if any(not any(f" {phrase} " in field for field in fields) for phrase in phrases):
                     continue
-            basis = "Passage meaning"
+            basis = "Title meaning" if chunk_id in title_led else "Passage meaning"
             exact_name = exact_filename or exact_title
             filename_match = bool(query_terms and query_terms <= filename_terms)
             # Evidence determines admission before relative ranking or metadata boosts.

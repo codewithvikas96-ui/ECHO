@@ -54,6 +54,49 @@ class SearchRankingTests(unittest.TestCase):
             self.assertEqual({item["kind"] for item in hits}, {"pdf", "webpage", "note"})
             self.assertEqual(self.archive.search('"ventilation cross"', mode), [])
 
+    def test_title_paraphrases_and_unrelated_queries(self):
+        cases = [
+            ("Business travel reimbursement", "How do I get paid back for a work trip?"),
+            ("Emergency evacuation routes", "Where should we go if the building is on fire?"),
+            ("Rainwater harvesting", "How do I collect the water that runs off my roof?"),
+            ("Password recovery instructions", "How do I regain access after forgetting my login?"),
+            ("Extending laptop battery life", "How can a notebook computer last longer between charges?"),
+            ("Sleep and memory consolidation", "How does sleeping help the brain retain what it learns?"),
+        ]
+        with TemporaryDirectory() as directory:
+            archive = Archive(Path(directory), self.archive.get_model())
+            for number, (title, _) in enumerate(cases, start=1):
+                body = f"Revision {number}. See the signed checklist and updated instructions in the appendix."
+                archive.add(Document(title, "pdf", [(1, body)]))
+            for mode in ("semantic", "contextual"):
+                for title, query in cases:
+                    with self.subTest(mode=mode, title=title):
+                        results = archive.search(query, mode, top_k=1)
+                        self.assertEqual([r["title"] for r in results], [title])
+                for query in ("cloud computing", "sourdough starter", "coral reef"):
+                    self.assertEqual(archive.search(query, mode), [])
+                self.assertEqual(archive.search(cases[0][1], mode, kinds=["note"]), [])
+
+    def test_upgrade_archive_with_passage_only_embeddings(self):
+        with TemporaryDirectory() as directory:
+            archive = Archive(Path(directory), self.archive.get_model())
+            source_id, _ = archive.add(Document("Rainwater harvesting", "pdf", [(1, "Read the appendix.")]))
+            with archive.connect() as db:
+                original = db.execute("SELECT id,vector FROM chunks").fetchone()
+                db.execute("DROP TABLE title_vectors")
+            reopened = Archive(Path(directory), self.archive.get_model())
+            reopened.search("appendix", "keyword")
+            with reopened.connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM title_vectors").fetchone()[0], 0)
+            result = reopened.search("How do I collect the water that runs off my roof?", "semantic")[0]
+            self.assertEqual((result["id"], result["match_basis"]), (source_id, "Title meaning"))
+            with reopened.connect() as db:
+                self.assertEqual(tuple(db.execute("SELECT id,vector FROM chunks").fetchone()), tuple(original))
+                self.assertEqual(db.execute("SELECT source_id FROM title_vectors").fetchone()[0], source_id)
+            self.assertTrue(reopened.delete(source_id))
+            with reopened.connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM title_vectors").fetchone()[0], 0)
+
     def test_refresh_image_ocr_preserves_original_source(self):
         with TemporaryDirectory() as directory:
             archive = Archive(Path(directory), self.archive.get_model())
