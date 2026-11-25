@@ -51,6 +51,30 @@ class PrivateArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await bob.get("/api/sources")).json(), [])
         for method, url in (("GET", path), ("GET", path + "/original"), ("DELETE", path)):
             self.assertEqual((await bob.request(method, url)).status_code, 404)
+        selected_file = {"file": ("itinerary.txt", b"Sunflower itinerary for the expedition")}
+        self.assertEqual((await anonymous.post("/api/sources/index-file", files=selected_file)).status_code, 401)
+        self.assertEqual((await alice.post("/api/sources/index-file", files=selected_file,
+                                           headers={"X-Echo-Account": "bob"})).status_code, 401)
+        indexed = await alice.post("/api/sources/index-file", files=selected_file)
+        self.assertEqual(indexed.status_code, 200, indexed.text)
+        indexed_id = indexed.json()["id"]
+        indexed_path = f"/api/sources/{indexed_id}"
+        self.assertFalse((await alice.get(indexed_path)).json()["has_original"])
+        self.assertTrue((await alice.get(path)).json()["has_original"])
+        self.assertEqual((await alice.get(indexed_path + "/original")).status_code, 404)
+        lookup = {"query": "sunflower itinerary", "mode": "semantic"}
+        self.assertEqual((await alice.post("/api/search", json=lookup)).json()["results"][0]["id"], indexed_id)
+        self.assertEqual((await bob.post("/api/search", json=lookup)).json()["results"], [])
+        self.assertFalse((await alice.post("/api/sources/index-file", files=selected_file)).json()["created"])
+        self.assertEqual((await alice.delete(indexed_path)).status_code, 204)
+        self.assertEqual((await alice.get(indexed_path)).status_code, 404)
+        remote = await self.enterAsyncContext(httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app, client=("192.0.2.9", 12345)), base_url="http://localhost",
+            headers={"X-Echo-Request": "1"}, cookies=alice.cookies))
+        self.assertEqual((await remote.post("/api/sources/index-file", files=selected_file)).status_code, 403)
+        secure = await remote.post("https://localhost/api/sources/index-file", files=selected_file)
+        self.assertEqual(secure.status_code, 200)
+        self.assertEqual((await alice.delete(f"/api/sources/{secure.json()['id']}")).status_code, 204)
         # Both databases assign the same first ID. Each request must still use its own archive.
         other_file = b"Library opening hours"
         uploaded = await bob.post("/api/sources/import", files={"file": ("schedule.txt", other_file)})
