@@ -10,6 +10,7 @@ import { api, formatDate, kindLabels, message, modeLabels, post } from './api';
 import type { Health, Kind, Mode, Report, Result, Source, SourceDetail } from './api';
 import './styles.css';
 import { Account } from './Account';
+import { StorageImport } from './StorageImport';
 
 type Page = 'search' | 'library' | 'evaluation' | 'settings';
 type Filters = { kind: Kind | ''; from: string; to: string };
@@ -107,8 +108,9 @@ async function uploadItem(item: ImportItem, date: string, username: string, sign
   return api<{ created: boolean }>('/sources/import', { method: 'POST', body: form, headers, signal });
 }
 
-function ImportDialog({ onClose, onAdded, onIndexed, health, username }: {
+function ImportDialog({ onClose, onAdded, onIndexed, onStorage, health, username }: {
   username: string;
+  onStorage: () => void;
   onClose: () => void; onAdded: (notice: string) => void; onIndexed: () => void; health: Health | null;
 }) {
   const [tab, setTab] = useState<'file' | 'note' | 'webpage'>('file');
@@ -214,6 +216,7 @@ function ImportDialog({ onClose, onAdded, onIndexed, health, username }: {
           <span>PDF, TXT, Markdown, DOCX, or HTML · 16 MB per file</span>
           {health?.ocr_available && <span>PNG, JPEG, and WebP screenshots are also supported</span>}
         </button>
+        {!items.length && <button type="button" className="secondary" onClick={onStorage}><HardDrive size={17} /> Index device storage…</button>}
       </> : <>
         <label>Title<input required={hasDraft || !pending.length} maxLength={240} value={title} onChange={event => setTitle(event.target.value)} placeholder={tab === 'note' ? 'Title of your note' : 'Title of the webpage'} /></label>
         {tab === 'webpage' && <label>Original URL (optional)<input type="url" maxLength={2048} value={url} onChange={event => setUrl(event.target.value)} placeholder="https://example.com/article" /></label>}
@@ -288,7 +291,7 @@ function SourceDialog({ id, match, onClose, onDelete }: {
       <div className="detail-toolbar">
         <div className="detail-meta"><SourceIcon kind={detail.kind} /><span>{kindLabels[detail.kind]} · {formatDate(detail.source_date)}</span></div>
         {detail.url && <a className="secondary" href={detail.url} target="_blank" rel="noreferrer">Open original</a>}
-        {detail.filename && detail.kind !== 'webpage' && <a className="secondary"
+        {detail.has_original && <a className="secondary"
           href={file + (detail.kind === 'pdf' && selectedPassage?.page ? '#page=' + selectedPassage.page : '')}
           target="_blank" rel="noreferrer">
           {detail.kind === 'pdf' ? 'Open PDF' : 'Download file'}</a>}
@@ -364,6 +367,8 @@ function App({ username, logout }: { username: string; logout: () => Promise<voi
   const [libraryQuery, setLibraryQuery] = useState('');
   const [libraryOrder, setLibraryOrder] = useState('recent');
   const [importOpen, setImportOpen] = useState(false);
+  const [storageOpen, setStorageOpen] = useState(false);
+  const [storageBusy, setStorageBusy] = useState(false);
   const [selectedSource, setSelectedSource] = useState<{ id: number; match?: number }>();
   const [notice, setNotice] = useState('');
   const [addingSample, setAddingSample] = useState(false);
@@ -585,7 +590,8 @@ function App({ username, logout }: { username: string; logout: () => Promise<voi
               <p>Signed in as <strong>{username}</strong>.</p>
               <button className="secondary" onClick={() => void logout().catch(error => setLocalError(message(error)))}>Sign out</button></section>
             <section className="panel settings-panel"><HardDrive size={22} /><h2>Local storage</h2>
-              <p>ECHO stores your files, extracted passages, and embeddings in SQLite on this device. Search queries are processed locally and aren’t saved.</p>
+              <p>Choose files, a folder, or a ZIP. Review the contents before sending selected files to your ECHO host for indexing.</p>
+              <button type="button" className="secondary" onClick={() => setStorageOpen(true)}>Index device storage…</button>
               <a className="plain link-button" href="#library">Manage sources</a></section>
             <section className="panel settings-panel"><Sparkles size={22} /><h2>Search model</h2>
               <p>{health?.model || 'all-MiniLM-L6-v2'} creates embeddings on this device. FAISS ranks passages by cosine similarity.</p>
@@ -600,7 +606,11 @@ function App({ username, logout }: { username: string; logout: () => Promise<voi
       </main>
     </div>
     {importOpen && <ImportDialog username={username} health={health} onIndexed={refresh} onClose={() => setImportOpen(false)}
+      onStorage={() => { setImportOpen(false); setStorageOpen(true); }}
       onAdded={text => { setImportOpen(false); setNotice(text); void refresh(); }} />}
+    {storageOpen && <Modal wide title="Index device storage" onClose={() => { if (!storageBusy) setStorageOpen(false); }}>
+      <StorageImport username={username} health={health} onIndexed={refresh} onBusy={setStorageBusy} />
+    </Modal>}
     {selectedSource && <SourceDialog key={selectedSource.id} id={selectedSource.id} match={selectedSource.match}
       onClose={() => setSelectedSource(undefined)}
       onDelete={id => {

@@ -12,7 +12,7 @@ export type Source = {
   passage_count: number;
 };
 export type Passage = { id: number; page: number | null; text: string };
-export type SourceDetail = Omit<Source, 'passage_count'> & { passages: Passage[] };
+export type SourceDetail = Omit<Source, 'passage_count'> & { passages: Passage[]; has_original: boolean };
 export type Result = Omit<Source, 'passage_count'> & {
   chunk_id: number; page: number | null; excerpt: string; score: number; similarity: number | null; match_basis?: string;
 };
