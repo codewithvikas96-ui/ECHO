@@ -637,8 +637,9 @@ function App({ username, logout }: { username: string; logout: () => Promise<voi
               <button type="button" className="secondary" onClick={() => setStorageOpen(true)}>Index device storage…</button>
               <a className="plain link-button" href="#library">Manage sources</a></section>
             <section className="panel settings-panel"><Sparkles size={22} /><h2>Search model</h2>
-              <p>{health?.model || 'all-MiniLM-L6-v2'} creates embeddings on this device. FAISS ranks passages by cosine similarity.</p>
-              <span className="settings-status">{health ? health.model_ready ? 'Model installed' : 'Model setup required' : 'Checking model…'}</span></section>
+              <p>FAISS finds similar passages. A second model compares your query directly with the strongest candidate passages.</p>
+              <span className="settings-status">{health ? !health.model_ready ? 'Model setup required' :
+                health.reranker_ready ? 'FAISS and reranker ready' : 'FAISS ready · reranker setup required' : 'Checking model…'}</span></section>
             <section className="panel settings-panel"><BookOpen size={22} /><h2>Sample archive</h2>
               <p>Add 12 labelled example sources to try the import and search workflow.</p>
               <button className="secondary" onClick={addSample} disabled={addingSample}>{addingSample ? 'Indexing…' : 'Load sample archive'}</button></section>

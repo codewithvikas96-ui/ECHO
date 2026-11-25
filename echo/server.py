@@ -24,7 +24,7 @@ from .archive import Archive
 from .embeddings import Embedder
 from .demo import evaluate, seed
 from .extract import Document, MAX_TEXT, MAX_UPLOAD, from_file, valid_url
-from .model_setup import DATA_DIR, MODEL_ID, ROOT
+from .model_setup import DATA_DIR, MODEL_ID, ROOT, reranker_ready
 from .ocr import find_tesseract
 
 Kind = Literal["pdf", "text", "docx", "image", "webpage", "note"]
@@ -144,6 +144,7 @@ def health():
     return {
         "model": MODEL_ID,
         "model_ready": all((DATA_DIR / "model" / name).is_file() for name in ("model.onnx", "tokenizer.json")),
+        "reranker_ready": reranker_ready(DATA_DIR),
         "ocr_available": bool(find_tesseract()),
         "vector_index": "FAISS",
         "storage": "SQLite",

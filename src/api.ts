@@ -23,7 +23,7 @@ export type Report = {
     median_ms: number; p95_ms: number; queries: { query: string; rank: number | null }[];
   }[];
 };
-export type Health = { model: string; model_ready: boolean; ocr_available: boolean };
+export type Health = { model: string; model_ready: boolean; reranker_ready: boolean; ocr_available: boolean };
 
 export const kindLabels: Record<Kind, string> = {
   pdf: 'PDF', text: 'Text file', docx: 'Word document', image: 'Screenshot', webpage: 'Webpage', note: 'Note',
