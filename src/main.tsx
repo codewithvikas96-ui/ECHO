@@ -91,26 +91,31 @@ type ImportItem = {
   error: string;
 } & ({ kind: 'file'; file: File } | { kind: 'note' | 'webpage'; content: string });
 
-async function uploadItem(item: ImportItem, date: string) {
+async function uploadItem(item: ImportItem, date: string, username: string, signal: AbortSignal) {
+  const headers = { 'X-Echo-Account': username };
   if (item.kind !== 'file') {
-    return post<{ created: boolean }>('/sources/text', {
+    return api<{ created: boolean }>('/sources/text', { method: 'POST', signal,
+      headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({
       title: item.name, content: item.content, url: item.url, kind: item.kind, source_date: date || null,
-    });
+    }) });
   }
   if (item.file.size > 16 * 1024 * 1024) throw new Error('This file exceeds 16 MB.');
   const form = new FormData();
   form.set('file', item.file);
   if (date) form.set('source_date', date);
   if (item.url) form.set('url', item.url);
-  return api<{ created: boolean }>('/sources/import', { method: 'POST', body: form });
+  return api<{ created: boolean }>('/sources/import', { method: 'POST', body: form, headers, signal });
 }
 
-function ImportDialog({ onClose, onAdded, onIndexed, health }: {
+function ImportDialog({ onClose, onAdded, onIndexed, health, username }: {
+  username: string;
   onClose: () => void; onAdded: (notice: string) => void; onIndexed: () => void; health: Health | null;
 }) {
   const [tab, setTab] = useState<'file' | 'note' | 'webpage'>('file');
   const [items, setItems] = useState<ImportItem[]>([]);
   const nextId = useRef(0);
+  const transfer = useRef<AbortController | null>(null);
+  useEffect(() => () => { transfer.current?.abort(); }, []);
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
   const [url, setUrl] = useState('');
@@ -148,16 +153,20 @@ function ImportDialog({ onClose, onAdded, onIndexed, health }: {
   }
 
   async function importItems(batch: ImportItem[], total: number) {
+    const controller = new AbortController();
+    transfer.current = controller;
     let indexed = 0;
     let succeeded = 0;
     for (const item of batch) {
+      if (controller.signal.aborted) return;
       updateItem(item.id, { status: 'Indexing…', error: '' });
       try {
-        const { created } = await uploadItem(item, date);
+        const { created } = await uploadItem(item, date, username, controller.signal);
         updateItem(item.id, { status: created ? 'Indexed' : 'Already in library' });
         if (created) indexed++;
         succeeded++;
       } catch (error) {
+        if (controller.signal.aborted) return;
         updateItem(item.id, { status: 'Failed', error: message(error) });
       }
     }
@@ -590,7 +599,7 @@ function App({ username, logout }: { username: string; logout: () => Promise<voi
         </div>}
       </main>
     </div>
-    {importOpen && <ImportDialog health={health} onIndexed={refresh} onClose={() => setImportOpen(false)}
+    {importOpen && <ImportDialog username={username} health={health} onIndexed={refresh} onClose={() => setImportOpen(false)}
       onAdded={text => { setImportOpen(false); setNotice(text); void refresh(); }} />}
     {selectedSource && <SourceDialog key={selectedSource.id} id={selectedSource.id} match={selectedSource.match}
       onClose={() => setSelectedSource(undefined)}

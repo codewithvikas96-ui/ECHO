@@ -40,7 +40,7 @@ export function setActiveAccount(username: string | null) {
 export async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const headers = new Headers(options?.headers);
   headers.set('X-Echo-Request', '1');
-  if (activeAccount) headers.set('X-Echo-Account', activeAccount);
+  if (activeAccount && !headers.has('X-Echo-Account')) headers.set('X-Echo-Account', activeAccount);
   const response = await fetch('/api' + path, { ...options, headers, cache: 'no-store' });
   if (response.status === 401 && activeAccount && !path.startsWith('/account')) {
     window.dispatchEvent(new Event('echo-session-ended'));
