@@ -188,22 +188,40 @@ def import_file(
 
 
 @app.post("/api/sources/index-file")
-def index_storage_file(archive: PrivateArchive, file: Annotated[UploadFile, File()]):
-    return index_upload(archive, file, None, "", retain_original=False)
+def index_storage_file(archive: PrivateArchive, file: Annotated[UploadFile, File()],
+                       refresh_pdf_id: Annotated[int | None, Form(gt=0)] = None):
+    return index_upload(archive, file, None, "", retain_original=False, refresh_pdf_id=refresh_pdf_id)
 
 
-def index_upload(archive: Archive, file: UploadFile, source_date: date | None, url: str, *, retain_original: bool):
+def index_upload(archive: Archive, file: UploadFile, source_date: date | None, url: str, *, retain_original: bool,
+                 refresh_pdf_id: int | None = None):
     require_model()
     try:
         document = from_file(file.filename or "", file.file.read(MAX_UPLOAD + 1), url=url)
         if not retain_original:
             document.original = None
-        source_id, created = archive.add(document, source_date)
+        source_id, created = archive.add(document, source_date, refresh_pdf_id=refresh_pdf_id)
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
     except (PdfReadError, BadZipFile, KeyError, ParseError, DefusedXmlException) as error:
         raise HTTPException(422, "The file could not be parsed. Verify the format and try another copy.") from error
     return {"id": source_id, "created": created}
+
+
+@app.post("/api/sources/{source_id}/reindex-pdf")
+def reindex_pdf(source_id: int, archive: PrivateArchive):
+    source = archive.original(source_id)
+    if not source or source["kind"] != "pdf":
+        raise HTTPException(404, "PDF not found in this account.")
+    if source["original"] is None:
+        raise HTTPException(422, "Choose the PDF again to refresh this index-only source.")
+    require_model()
+    try:
+        document = from_file(source["filename"], source["original"])
+        archive.add(document, refresh_pdf_id=source_id)
+    except (ValueError, PdfReadError) as error:
+        raise HTTPException(422, str(error)) from error
+    return {"id": source_id}
 
 
 @app.post("/api/sources/text")

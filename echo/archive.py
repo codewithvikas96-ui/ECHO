@@ -151,30 +151,39 @@ class Archive:
         with self.connect() as db:
             return db.execute("SELECT filename, kind, original FROM sources WHERE id=?", (source_id,)).fetchone()
 
-    def add(self, document: Document, source_date: date | None = None, sample_key: str | None = None) -> tuple[int, bool]:
+    def add(self, document: Document, source_date: date | None = None, sample_key: str | None = None,
+            *, refresh_pdf_id: int | None = None) -> tuple[int, bool]:
         model = self.get_model()
         chunks = chunk_sections(document, model.chunk_tokenizer)
         content = "\n".join(text for _, text in chunks)
         key = sha256(f"{document.kind}\x00{document.url}\x00{content}".encode()).hexdigest()
         with self.connect() as db:
             existing = db.execute("SELECT id FROM sources WHERE fingerprint=?", (key,)).fetchone()
-        if existing:
+        if existing and refresh_pdf_id is None:
             return existing["id"], False
         vectors = model.encode([text for _, text in chunks] + [document.title])
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT id FROM sources WHERE fingerprint=?", (key,)).fetchone()
+            previous_file = None
+            if refresh_pdf_id is not None:
+                previous_file = db.execute("""
+                    SELECT id,title FROM sources WHERE id=? AND kind='pdf' AND filename=? AND original IS ?
+                """, (refresh_pdf_id, document.filename, document.original)).fetchone()
+                if not previous_file or document.kind != "pdf":
+                    raise ValueError("Select the same PDF for this library entry.")
+                if existing and existing["id"] != refresh_pdf_id:
+                    raise ValueError("Another source already contains this text. The existing index was kept.")
             if existing:
                 return existing["id"], False
-            previous_image = None
-            if document.kind == "image" and document.original:
-                previous_image = db.execute(
-                    "SELECT id, title FROM sources WHERE kind='image' AND original=? ORDER BY id LIMIT 1",
-                    (document.original,),
+            if previous_file is None and document.kind in {"image", "pdf"} and document.original:
+                previous_file = db.execute(
+                    "SELECT id, title FROM sources WHERE kind=? AND original=? ORDER BY id LIMIT 1",
+                    (document.kind, document.original),
                 ).fetchone()
-            if previous_image:
+            if previous_file:
                 # Refresh derived OCR in place so bookmarks, dates and originals survive a retry.
-                source_id, title = previous_image["id"], previous_image["title"]
+                source_id, title = previous_file["id"], previous_file["title"]
                 db.execute("UPDATE sources SET fingerprint=? WHERE id=?", (key, source_id))
                 db.execute("DELETE FROM keywords WHERE rowid IN (SELECT id FROM chunks WHERE source_id=?)", (source_id,))
                 db.execute("DELETE FROM chunks WHERE source_id=?", (source_id,))
@@ -196,7 +205,7 @@ class Archive:
                 )
                 db.execute("INSERT INTO keywords(rowid,title,body) VALUES(?,?,?)", (chunk.lastrowid, title, text))
             db.execute("UPDATE catalog SET revision=revision+1")
-        return source_id, previous_image is None
+        return source_id, previous_file is None
 
     def delete(self, source_id: int) -> bool:
         with self.connect() as db:
