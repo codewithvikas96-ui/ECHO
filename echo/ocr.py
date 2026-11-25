@@ -9,6 +9,10 @@ from time import monotonic
 from PIL import Image, ImageOps, ImageStat, UnidentifiedImageError
 
 
+class NoReadableText(ValueError):
+    """The image was processed successfully but contained no recognized text."""
+
+
 def find_tesseract() -> str | None:
     executable = shutil.which("tesseract")
     if executable or os.name != "nt":
@@ -72,8 +76,12 @@ def extract_image(data: bytes) -> str:
         gray = grayscale(data)
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as error:
         raise ValueError("ECHO could not open this image. Export it as PNG, JPEG, or WebP and try again.") from error
+    return read_printed_text(gray, executable)
+
+
+def read_printed_text(gray: Image.Image, executable: str) -> str:
     if gray.getextrema()[0] == gray.getextrema()[1]:
-        raise ValueError("No readable text found. Crop around clear, printed English text and try again.")
+        raise NoReadableText("No readable text found. Crop around clear, printed English text and try again.")
 
     # Use a light background and enlarge small glyphs while bounding the OCR working image.
     if ImageStat.Stat(gray).median[0] < 128:
@@ -104,5 +112,5 @@ def extract_image(data: bytes) -> str:
         if not best[0]:
             raise ValueError("OCR could not process this image. Check that Tesseract has English language data.") from error
     if best[2] == 0:
-        raise ValueError("No readable text found. Crop around clear, printed English text and try again.")
+        raise NoReadableText("No readable text found. Crop around clear, printed English text and try again.")
     return best[0]
