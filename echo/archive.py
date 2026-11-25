@@ -140,11 +140,12 @@ class Archive:
     def detail(self, source_id: int) -> dict | None:
         with self.connect() as db:
             db.execute("BEGIN")
-            row = db.execute(f"SELECT {SOURCE_COLUMNS} FROM sources s WHERE id=?", (source_id,)).fetchone()
+            row = db.execute(f"SELECT {SOURCE_COLUMNS}, original IS NOT NULL AS has_original FROM sources s WHERE id=?",
+                             (source_id,)).fetchone()
             if not row:
                 return None
             passages = db.execute("SELECT id, page, text FROM chunks WHERE source_id=? ORDER BY id", (source_id,))
-            return {**dict(row), "passages": [dict(passage) for passage in passages]}
+            return {**dict(row), "has_original": bool(row["has_original"]), "passages": [dict(passage) for passage in passages]}
 
     def original(self, source_id: int):
         with self.connect() as db:

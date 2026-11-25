@@ -74,6 +74,11 @@ async def local_browser_only(request: Request, call_next):
                         headers={"WWW-Authenticate": 'Basic realm="ECHO phone test"', "Cache-Control": "no-store"})
     origin = request.headers.get("origin")
     if request.url.path.startswith("/api/"):
+        if request.url.path == "/api/sources/index-file" and request.url.scheme != "https" and (
+            request.url.hostname not in {"127.0.0.1", "::1", "localhost"}
+            or not request.client or request.client.host not in {"127.0.0.1", "::1"}
+        ):
+            return Response("Use HTTPS or open ECHO on localhost to index device storage.", status_code=403)
         if request.method not in {"GET", "HEAD", "OPTIONS"} and request.headers.get("x-echo-request") != "1":
             return Response("Use the ECHO app to make changes.", status_code=403)
         if request.headers.get("sec-fetch-site") == "cross-site":
@@ -179,9 +184,20 @@ def import_file(
     source_date: Annotated[date | None, Form()] = None,
     url: Annotated[str, Form(max_length=2048)] = "",
 ):
+    return index_upload(archive, file, source_date, url, retain_original=True)
+
+
+@app.post("/api/sources/index-file")
+def index_storage_file(archive: PrivateArchive, file: Annotated[UploadFile, File()]):
+    return index_upload(archive, file, None, "", retain_original=False)
+
+
+def index_upload(archive: Archive, file: UploadFile, source_date: date | None, url: str, *, retain_original: bool):
     require_model()
     try:
         document = from_file(file.filename or "", file.file.read(MAX_UPLOAD + 1), url=url)
+        if not retain_original:
+            document.original = None
         source_id, created = archive.add(document, source_date)
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
