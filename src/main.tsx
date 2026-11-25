@@ -253,20 +253,23 @@ function ImportDialog({ onClose, onAdded, onIndexed, onStorage, health, username
   </Modal>;
 }
 
-function SourceDialog({ id, match, onClose, onDelete }: {
-  id: number; match?: number; onClose: () => void; onDelete: (id: number) => void;
+function SourceDialog({ id, match, onClose, onDelete, onReindexed }: {
+  id: number; match?: number; onClose: () => void; onDelete: (id: number) => void; onReindexed: () => void;
 }) {
   const [detail, setDetail] = useState<SourceDetail>();
   const [error, setError] = useState('');
   const [confirm, setConfirm] = useState(false);
   const [working, setWorking] = useState(false);
   const matched = useRef<HTMLElement>(null);
+  const [replacement, setReplacement] = useState<File>();
+  const [refreshStatus, setRefreshStatus] = useState('');
+  const refreshRequest = useRef<AbortController | null>(null);
   useEffect(() => {
     const controller = new AbortController();
     api<SourceDetail>('/sources/' + id, { signal: controller.signal }).then(setDetail).catch(error => {
       if (!controller.signal.aborted) setError(message(error));
     });
-    return () => controller.abort();
+    return () => { controller.abort(); refreshRequest.current?.abort(); };
   }, [id]);
   useEffect(() => { matched.current?.scrollIntoView({ block: 'nearest' }); }, [detail]);
 
@@ -279,6 +282,34 @@ function SourceDialog({ id, match, onClose, onDelete }: {
     } catch (error) {
       setError(message(error));
       setWorking(false);
+    }
+  }
+
+  async function refreshPdf() {
+    if (!detail || working) return;
+    const controller = new AbortController();
+    refreshRequest.current = controller;
+    setError('');
+    setWorking(true);
+    setRefreshStatus('Reading PDF pages…');
+    try {
+      if (detail.has_original) {
+        await post('/sources/' + id + '/reindex-pdf', undefined, controller.signal);
+      } else {
+        if (!replacement || replacement.name !== detail.filename) throw new Error('Choose ' + detail.filename + ' to refresh this source.');
+        const body = new FormData();
+        body.append('file', replacement);
+        body.append('refresh_pdf_id', String(id));
+        await api('/sources/index-file', { method: 'POST', body, signal: controller.signal });
+      }
+      const updated = await api<SourceDetail>('/sources/' + id, { signal: controller.signal });
+      setDetail(updated);
+      setRefreshStatus('PDF index refreshed. You can search the updated passages now.');
+      onReindexed();
+    } catch (error) {
+      if (!controller.signal.aborted) { setError(message(error)); setRefreshStatus(''); }
+    } finally {
+      if (!controller.signal.aborted) setWorking(false);
     }
   }
 
@@ -295,7 +326,19 @@ function SourceDialog({ id, match, onClose, onDelete }: {
           href={file + (detail.kind === 'pdf' && selectedPassage?.page ? '#page=' + selectedPassage.page : '')}
           target="_blank" rel="noreferrer">
           {detail.kind === 'pdf' ? 'Open PDF' : 'Download file'}</a>}
+        {detail.kind === 'pdf' && detail.has_original && <button className="secondary" disabled={working}
+          onClick={refreshPdf}>Refresh PDF index</button>}
       </div>
+      {detail.kind === 'pdf' && !detail.has_original && <details>
+        <summary>Refresh PDF index</summary>
+        {window.isSecureContext ? <>
+          <p>Choose {detail.filename} again. ECHO will send it once to <strong>{location.host}</strong> and keep its text, filename and search index in your account.</p>
+          <input type="file" aria-label={'Choose ' + detail.filename} accept=".pdf,application/pdf" disabled={working}
+            onChange={event => setReplacement(event.target.files?.[0])} />
+          <button className="secondary" disabled={!replacement || working} onClick={refreshPdf}>Allow and refresh PDF index</button>
+        </> : <p>Open ECHO over HTTPS or use localhost on the host PC to select this file.</p>}
+      </details>}
+      {refreshStatus && <p role="status">{refreshStatus}</p>}
       <div className="passages">
         {detail.passages.map((passage, idx) => <article key={passage.id} ref={passage.id === match ? matched : undefined}
           className={passage.id === match ? 'matched' : ''}>
@@ -309,7 +352,7 @@ function SourceDialog({ id, match, onClose, onDelete }: {
         <div><button className="secondary" disabled={working} onClick={() => setConfirm(false)}>Keep source</button>
           <button className="danger" disabled={working} onClick={remove}>{working ? 'Removing…' : 'Remove source'}</button></div>
       </div> : <footer className="modal-actions">
-        <button className="plain danger-text" onClick={() => setConfirm(true)}><Trash2 size={16} /> Remove source</button>
+        <button className="plain danger-text" disabled={working} onClick={() => setConfirm(true)}><Trash2 size={16} /> Remove source</button>
       </footer>}
     </>}
   </Modal>;
@@ -599,8 +642,8 @@ function App({ username, logout }: { username: string; logout: () => Promise<voi
             <section className="panel settings-panel"><BookOpen size={22} /><h2>Sample archive</h2>
               <p>Add 12 labelled example sources to try the import and search workflow.</p>
               <button className="secondary" onClick={addSample} disabled={addingSample}>{addingSample ? 'Indexing…' : 'Load sample archive'}</button></section>
-            <section className="panel settings-panel"><CircleHelp size={22} /><h2>Screenshot OCR</h2>
-              <p>{health?.ocr_available ? 'Tesseract is available. Import a screenshot to search its text.' : 'Install Tesseract on this device and add it to PATH to index text from screenshots.'}</p></section>
+            <section className="panel settings-panel"><CircleHelp size={22} /><h2>PDF and screenshot OCR</h2>
+              <p>{health?.ocr_available ? 'Tesseract is available to read printed English text in screenshots and scanned PDF pages.' : 'Install Tesseract with English language data on the ECHO host to search scanned pages and screenshots.'}</p></section>
           </div>
         </div>}
       </main>
@@ -613,6 +656,7 @@ function App({ username, logout }: { username: string; logout: () => Promise<voi
     </Modal>}
     {selectedSource && <SourceDialog key={selectedSource.id} id={selectedSource.id} match={selectedSource.match}
       onClose={() => setSelectedSource(undefined)}
+      onReindexed={() => { searchRequest.current?.abort(); setSearching(false); setSearched(undefined); void refresh(); }}
       onDelete={id => {
         searchRequest.current?.abort();
         setSearching(false);
