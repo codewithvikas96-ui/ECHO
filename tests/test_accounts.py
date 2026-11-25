@@ -1,9 +1,11 @@
 import unittest
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import httpx
+from reportlab.pdfgen.canvas import Canvas
 
 from echo import accounts, server
 from echo.archive import Archive
@@ -99,3 +101,41 @@ class PrivateArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await alice.post("/api/account/login", json={**account, "password": "wrong"})).status_code, 401)
         self.assertEqual((await alice.post("/api/account/login", json=account)).status_code, 200)
         self.assertEqual((await alice.get(path + "/original")).content, file["file"][1])
+
+        other = await self.enterAsyncContext(client())
+        self.assertEqual((await other.post("/api/account/register", json={**account, "username": "carol"})).status_code, 201)
+        for retain in (True, False):
+            pdf = BytesIO()
+            canvas = Canvas(pdf)
+            word = "heliostat" if retain else "anemometer"
+            canvas.drawString(50, 400, "Measurements from the " + word)
+            canvas.save()
+            name = word + ".pdf"
+            original = pdf.getvalue()
+            files = {"file": (name, original)}
+            route = "/api/sources/import" if retain else "/api/sources/index-file"
+            legacy = Document(name, "pdf", [(1, "Legacy footer " + word[:3])], filename=name, original=original)
+            with patch.object(server, "from_file", return_value=legacy):
+                result = await alice.post(route, files=files)
+            self.assertEqual(result.status_code, 200, result.text)
+            pdf_id = result.json()["id"]
+            pdf_path = f"/api/sources/{pdf_id}"
+            endpoint = pdf_path + "/reindex-pdf"
+            self.assertEqual((await anonymous.post(endpoint)).status_code, 401)
+            self.assertEqual((await other.post(endpoint)).status_code, 404)
+            if retain:
+                refreshed = await alice.post(endpoint)
+                self.assertEqual((await alice.get(pdf_path + "/original")).content, original)
+            else:
+                self.assertEqual((await alice.post(endpoint)).status_code, 422)
+                form = {"refresh_pdf_id": str(pdf_id)}
+                wrong = await alice.post(route, data=form, files={"file": ("different.pdf", original)})
+                self.assertEqual(wrong.status_code, 422)
+                self.assertIn("Legacy footer", (await alice.get(pdf_path)).json()["passages"][0]["text"])
+                refreshed = await alice.post(route, data=form, files=files)
+                self.assertEqual((await alice.get(pdf_path + "/original")).status_code, 404)
+            self.assertEqual(refreshed.status_code, 200, refreshed.text)
+            self.assertEqual(refreshed.json()["id"], pdf_id)
+            detail = (await alice.get(pdf_path)).json()
+            self.assertEqual(detail["has_original"], retain)
+            self.assertIn(word, detail["passages"][0]["text"])
