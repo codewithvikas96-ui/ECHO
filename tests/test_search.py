@@ -6,7 +6,7 @@ import unittest
 
 from echo.archive import Archive
 from echo.extract import Document
-from echo.model_setup import DATA_DIR
+from echo.model_setup import DATA_DIR, reranker_ready
 
 
 class SearchRankingTests(unittest.TestCase):
@@ -53,6 +53,37 @@ class SearchRankingTests(unittest.TestCase):
             hits = self.archive.search('“cross ventilation”', mode)
             self.assertEqual({item["kind"] for item in hits}, {"pdf", "webpage", "note"})
             self.assertEqual(self.archive.search('"ventilation cross"', mode), [])
+
+    def test_literal_technical_queries(self):
+        with TemporaryDirectory() as directory:
+            archive = Archive(Path(directory), self.archive.get_model())
+            lstm, _ = archive.add(Document("15.LSTM Architecture", "pdf", [
+                (1, "An introduction to recurrent networks."),
+                (4, "The forget gate controls which values survive in the previous cell state."),
+            ], filename="15.LSTM Architecture.pdf"))
+            words, _ = archive.add(Document("Word2Vec reading material", "pdf", [(2, "A guide to word embeddings.")]))
+            archive.add(Document("Gate maintenance", "note", [(None, "Forget the combination on an old garden gate.")]))
+            for mode in ("keyword", "contextual", "semantic"):
+                for query, expected in (("LTSM Architecture", lstm), ("word 2 vec", words), ("forget gate", lstm)):
+                    with self.subTest(mode=mode, query=query):
+                        hit = archive.search(query, mode)[0]
+                        self.assertEqual(hit["id"], expected)
+                        if query == "forget gate":
+                            self.assertEqual((hit["page"], hit["match_basis"]), (4, "Exact passage phrase"))
+                self.assertEqual(archive.search("forget gate", mode, kinds=["image"]), [])
+
+    @unittest.skipUnless(reranker_ready(DATA_DIR), "Run echo.model_setup to install the local reranker")
+    def test_reranker_resolves_context_vs_center_word(self):
+        with TemporaryDirectory() as directory:
+            archive = Archive(Path(directory), self.archive.get_model())
+            for title, body in (
+                ("Attention diagrams", "Attention uses queries, keys, and values to select how much one token influences another. A mask hides future tokens during training."),
+                ("Vector learning", "In skip-gram, the input is the center word. The model predicts neighboring words in a context window from this center word."),
+                ("Pooled context", "The continuous bag of words (CBOW) objective uses neighboring words as input and predicts the center word."),
+            ):
+                archive.add(Document(title, "note", [(None, body)]))
+            hits = archive.search("How is the middle token inferred from nearby words?", "contextual", top_k=1)
+            self.assertEqual([item["title"] for item in hits], ["Pooled context"])
 
     def test_title_paraphrases_and_unrelated_queries(self):
         cases = [
