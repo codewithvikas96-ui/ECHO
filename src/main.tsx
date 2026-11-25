@@ -561,7 +561,7 @@ function App({ username, logout }: { username: string; logout: () => Promise<voi
             {searchError && <div className="error" role="alert">{searchError}</div>}
             <p className="mode-hint">{{
               contextual: 'Uses passage meaning, topic words, and source names.',
-              semantic: 'Finds sources by the meaning of their titles and passages.',
+              semantic: 'Search by meaning, or enter a single word to find passages that contain it.',
               keyword: 'Short topics require all significant words. Use quotes for an exact phrase.',
             }[mode]}</p>
           </section>

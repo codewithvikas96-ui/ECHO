@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from functools import cached_property
 from hashlib import sha256
+from json import dumps
 from pathlib import Path
 from threading import Lock
 import re
@@ -91,6 +92,31 @@ def excerpt_for(text: str, query_terms: set[str], width: int = 230) -> str:
 TOPIC_MIN_SIMILARITY = 0.43
 DESCRIPTION_MIN_SIMILARITY = 0.27
 TOPIC_PREFIX = re.compile(r"^(?:please\s+)?(?:tell me about|what is|what are|search for|find information about)\s+", re.I)
+MIXED_IDENTIFIER = re.compile(r"(?=[a-z0-9]*[a-z])(?=[a-z0-9]*[0-9])[a-z0-9]+")
+
+
+def name_evidence(query_words, topic, query_terms, title, filename):
+    if filename and f" {filename} " in f" {query_words} ":
+        return "Exact filename"
+    if title and title == query_words:
+        return "Exact title"
+    title_terms = set(title.split())
+    compact = topic.replace(" ", "")
+    if " " in topic and any(MIXED_IDENTIFIER.fullmatch(word) and word == compact
+                                      for word in title_terms | set(filename.split())):
+        return "Matching identifier"
+    # Require the rest of the title to match before accepting one swapped pair (e.g. LTSM).
+    if all(word.isalpha() for word in query_terms):
+        title_terms = {word for word in title_terms if not word.isdecimal()}
+    if 2 <= len(query_terms) == len(title_terms):
+        missing, extra = query_terms - title_terms, title_terms - query_terms
+        if len(missing) == len(extra) == 1:
+            word, expected = next(iter(missing)), next(iter(extra))
+            if word.isalpha() and len(word) == len(expected) >= 4 and any(
+                word[:i] + word[i + 1] + word[i] + word[i + 2:] == expected for i in range(len(word) - 1)
+            ):
+                return "Similar title"
+    return ""
 
 
 class Archive:
@@ -231,47 +257,38 @@ class Archive:
                         """, (vector.astype("<f4", copy=False).tobytes(), row["id"], row["title"]))
                     db.execute("UPDATE catalog SET revision=revision+1")
 
-    def _semantic_scores(self, db, rows, query_vector) -> tuple[dict[int, float], set[int]]:
+    def _semantic_candidates(self, db, query_vector, floor: float) -> dict[int, float]:
         faiss.omp_set_num_threads(2)
         revision = db.execute("SELECT revision FROM catalog WHERE id=1").fetchone()[0]
         with self._index_lock:
             if revision != self._revision:
                 index = faiss.IndexIDMap(faiss.IndexFlatIP(DIMENSIONS))
                 # Positive IDs identify passages. Title IDs are negative and avoid FAISS's -1 sentinel.
-                vectors = list(db.execute("""
+                cursor = db.execute("""
                     SELECT id, vector FROM chunks
                     UNION ALL SELECT -source_id-1 AS id, vector FROM title_vectors
-                """))
-                if vectors:
+                """)
+                while vectors := cursor.fetchmany(1024):
                     ids = np.array([row["id"] for row in vectors], dtype=np.int64)
                     matrix = np.stack([np.frombuffer(row["vector"], dtype="<f4") for row in vectors])
                     index.add_with_ids(np.ascontiguousarray(matrix, dtype=np.float32), ids)
                 self._revision, self._index = revision, index
-            if not self._index.ntotal:
-                return {}, set()
-            scores, ids = self._index.search(query_vector, self._index.ntotal)
-        similarities = dict(zip(ids[0].tolist(), scores[0].tolist()))
-        combined = {}
-        title_led = set()
-        for row in rows:
-            passage = similarities[row["chunk_id"]]
-            title = similarities.get(-row["id"] - 1, 0.0)
-            # A descriptive title can recover a generic passage. Passage evidence still picks
-            # the excerpt when multiple chunks share that title.
-            combined[row["chunk_id"]] = max(passage, 0.8 * title + 0.2 * passage)
-            if combined[row["chunk_id"]] > passage:
-                title_led.add(row["chunk_id"])
-        return combined, title_led
+            _, scores, ids = self._index.range_search(query_vector, floor)
+        return dict(zip(ids.tolist(), scores.tolist()))
 
     def search(self, query: str, mode: str, kinds=(), date_from=None, date_to=None, top_k=8) -> list[dict]:
         topic = TOPIC_PREFIX.sub("", query.strip()).strip() or query
+        topic_words = normalized_words(topic)
         query_terms = terms(topic)
+        literal_lookup = topic_words in query_terms
         short_topic = len(query_terms) <= 3
         query_words = normalized_words(query)
         hint = SOURCE_REQUEST.search(query_words) if mode == "contextual" else None
         preferred_kind = SOURCE_HINTS[hint.group(1)] if hint else None
-        phrases = [normalized_words(value) for value in re.findall(r'["“]([^"”]+)["”]', query)]
-        phrases = [phrase for phrase in phrases if phrase] if mode != "semantic" else []
+        quoted = [normalized_words(value) for value in re.findall(r'["“]([^"”]+)["”]', query)]
+        phrases = [phrase for phrase in quoted if phrase] if mode != "semantic" else []
+        semantic_search = mode != "keyword"
+        floor = TOPIC_MIN_SIMILARITY if short_topic else DESCRIPTION_MIN_SIMILARITY
         filters = ["1=1"]
         params = []
         if kinds:
@@ -283,94 +300,157 @@ class Archive:
         if date_to:
             filters.append("s.source_date <= ?")
             params.append(str(date_to))
-        if mode != "keyword":
+        scope = " AND ".join(filters)
+        model = None
+        query_vector = None
+        if semantic_search:
             self._index_missing_titles()
+            model = self.get_model()
+            query_vector = model.encode([topic])
         with self.connect() as db:
             db.execute("BEGIN")
-            rows = list(db.execute(f"""
-                SELECT {SOURCE_COLUMNS}, c.id AS chunk_id, c.text, c.page
-                FROM chunks c JOIN sources s ON s.id=c.source_id
-                WHERE {' AND '.join(filters)}
-            """, params))
-            if not rows:
-                return []
+            names = {}
+            for source in db.execute(f"SELECT s.id, s.title, s.filename FROM sources s WHERE {scope}", params):
+                title, filename = normalized_words(source["title"]), normalized_words(source["filename"])
+                filename_terms = terms(Path(source["filename"]).stem)
+                overlap = len(filename_terms & query_terms) / max(1, len(query_terms))
+                basis = name_evidence(query_words, topic_words, query_terms, title, filename)
+                in_name = phrases and all(f" {phrase} " in f" {title} " or f" {phrase} " in f" {filename} "
+                                          for phrase in phrases)
+                if basis or overlap == 1 or in_name:
+                    names[source["id"]] = (basis, overlap)
             lexical = {}
-            if query_terms and mode != "semantic":
+            if query_terms:
                 joiner = " AND " if short_topic else " OR "
                 expression = joiner.join(f'"{word}"' for word in sorted(query_terms)[:48])
                 lexical = {
                     row["rowid"]: max(0.0, -row["strength"])
-                    for row in db.execute(
-                        "SELECT rowid, bm25(keywords, 2.0, 1.0) AS strength FROM keywords WHERE keywords MATCH ?",
-                        (expression,),
-                    )
+                    for row in db.execute(f"""
+                        SELECT keywords.rowid, bm25(keywords, 2.0, 1.0) AS strength
+                        FROM keywords JOIN chunks c ON c.id=keywords.rowid JOIN sources s ON s.id=c.source_id
+                        WHERE keywords MATCH ? AND {scope}
+                    """, (expression, *params))
                 }
-            semantic = {}
-            title_led = set()
-            if mode != "keyword":
-                semantic, title_led = self._semantic_scores(db, rows, self.get_model().encode([topic]))
-        minimum_similarity = TOPIC_MIN_SIMILARITY if short_topic else DESCRIPTION_MIN_SIMILARITY
-        # Keep weak tail results out even when one source strongly matches the query.
-        minimum_similarity = max(minimum_similarity, max(semantic.values(), default=0.0) - 0.22)
-        best_by_source = {}
-        lexical_max = max((lexical.get(row["chunk_id"], 0.0) for row in rows), default=0.0) or 1.0
+            dense = self._semantic_candidates(db, query_vector, floor - 0.08) if semantic_search else {}
+            source_ids = set(names) | {-idx - 1 for idx in dense if idx < 0}
+            chunk_ids = set(lexical) | {idx for idx in dense if idx > 0}
+            vector_column = ", c.vector" if semantic_search else ""
+            rows = list(db.execute(f"""
+                SELECT {SOURCE_COLUMNS}, c.id AS chunk_id, c.text, c.page{vector_column}
+                FROM chunks c JOIN sources s ON s.id=c.source_id WHERE {scope} AND c.id IN (
+                    SELECT value FROM json_each(?)
+                    UNION ALL
+                    SELECT id FROM chunks WHERE source_id IN (SELECT value FROM json_each(?))
+                ) ORDER BY c.id
+            """, (*params, dumps(list(chunk_ids)), dumps(list(source_ids)))))
+        if not rows:
+            return []
+        semantic = {}
+        title_led = set()
+        if semantic_search:
+            for row in rows:
+                chunk_id = row["chunk_id"]
+                passage = dense.get(chunk_id)
+                if passage is None:
+                    passage = float(np.frombuffer(row["vector"], dtype="<f4") @ query_vector[0])
+                title = dense.get(-row["id"] - 1, 0.0)
+                title_score = 0.8 * title + 0.2 * passage
+                semantic[chunk_id] = max(passage, title_score)
+                if title_score > passage:
+                    title_led.add(chunk_id)
+        minimum_similarity = max(floor, max(semantic.values(), default=0.0) - 0.22)
+        lexical_max = max(lexical.values(), default=0) or 1.0
+        candidates = []
         for row in rows:
             chunk_id = row["chunk_id"]
             keyword = lexical.get(chunk_id, 0.0) / lexical_max
             similarity = semantic.get(chunk_id, 0.0)
-            title = normalized_words(row["title"])
-            filename = normalized_words(row["filename"])
-            exact_filename = bool(filename and f" {filename} " in f" {query_words} ")
-            exact_title = bool(title and title == query_words)
-            filename_terms = terms(Path(row["filename"]).stem)
-            filename_overlap = len(filename_terms & query_terms) / max(1, len(query_terms))
+            name_basis, filename_overlap = names.get(row["id"], ("", 0.0))
+            body = f" {normalized_words(row['text'])} "
             if phrases:
-                fields = [f" {value} " for value in (normalized_words(row["text"]), title, filename)]
+                fields = (body, f" {normalized_words(row['title'])} ", f" {normalized_words(row['filename'])} ")
                 if any(not any(f" {phrase} " in field for field in fields) for phrase in phrases):
                     continue
+            exact_word = literal_lookup and f" {topic_words} " in body
+            exact_phrase = len(query_terms) >= 2 and f" {topic_words} " in body
+            coverage = len(query_terms.intersection(body.split())) / max(1, len(query_terms))
+            full_coverage = coverage == 1
+            strong_lexical = bool(name_basis or filename_overlap == 1 or phrases or (short_topic and chunk_id in lexical))
+            eligible = bool(name_basis or exact_word or exact_phrase or similarity >= minimum_similarity)
             basis = "Title meaning" if chunk_id in title_led else "Passage meaning"
-            exact_name = exact_filename or exact_title
-            filename_match = bool(query_terms and query_terms <= filename_terms)
-            # Evidence determines admission before relative ranking or metadata boosts.
-            phrase_match = bool(phrases) and query_terms <= terms(" ".join(phrases))
-            strong_lexical = exact_name or filename_match or phrase_match or (short_topic and chunk_id in lexical)
-            if mode == "semantic" and similarity < minimum_similarity:
-                continue
-            if mode == "contextual" and not strong_lexical and similarity < minimum_similarity:
-                continue
             if mode == "keyword":
-                if chunk_id not in lexical and not (filename_match or exact_name or phrase_match):
+                if chunk_id not in lexical and not strong_lexical and not (exact_word or exact_phrase):
                     continue
+                eligible = True
                 score = max(keyword, filename_overlap)
                 basis = "Matching words" if keyword >= filename_overlap else "Filename words"
-            elif mode == "semantic":
-                score = similarity
-            else:
-                title_match = len(query_terms & terms(row["title"])) / max(1, len(query_terms))
-                score = 0.82 * similarity + 0.12 * max(keyword, filename_overlap) + 0.06 * title_match
+            elif mode == "contextual":
+                eligible |= strong_lexical
+                # A rare shared word can dominate BM25 for a long natural-language query.
+                keyword_evidence = max(keyword if short_topic else keyword * coverage, filename_overlap)
+                score = (0.82 * similarity + 0.12 * keyword_evidence if literal_lookup
+                         else 0.74 * similarity + 0.25 * keyword_evidence)
                 if keyword:
                     basis = "Meaning and keywords" if similarity >= minimum_similarity else "Matching words"
-                elif filename_match:
+                elif filename_overlap:
                     basis = "Filename words"
                 if preferred_kind == row["kind"]:
-                    score += 0.08
+                    score += 0.20
                     basis = "Meaning and source type"
-            if mode != "semantic":
-                if phrases:
-                    basis = "Quoted phrase"
-                if exact_filename or exact_title:
-                    # Exact names outrank approximate hits. Passage relevance breaks ties.
-                    score += 2
-                    basis = "Exact filename" if exact_filename else "Exact title"
-            previous = best_by_source.get(row["id"])
-            if previous is None or score > previous["score"]:
-                result = dict(row)
-                result["excerpt"] = result.pop("text")
-                result["score"] = score
-                result["match_basis"] = basis
-                result["similarity"] = similarity if mode != "keyword" else None
-                best_by_source[row["id"]] = result
-        ranked = sorted(best_by_source.values(), key=lambda result: (-result["score"], result["id"]))[:top_k]
-        for result in ranked:
-            result["excerpt"] = excerpt_for(result["excerpt"], query_terms)
-        return ranked
+            else:
+                eligible |= short_topic and full_coverage
+                score = similarity + 0.08 * keyword
+            # Keep potential paraphrases for the second model to check.
+            if not eligible and (literal_lookup or similarity < floor - 0.08):
+                continue
+            if full_coverage:
+                score += 0.15
+            if exact_word or exact_phrase:
+                score += 1.0
+                basis = "Exact passage word" if exact_word else "Exact passage phrase"
+            if phrases:
+                basis = "Quoted phrase"
+            if name_basis:
+                score += 2.0 if name_basis.startswith("Exact") else 0.9
+                basis = name_basis
+            result = {key: row[key] for key in row.keys() if key not in ("vector", "text")}
+            result.update(excerpt=row["text"], score=score, match_basis=basis,
+                          similarity=similarity if semantic_search else None, eligible=eligible)
+            candidates.append(result)
+
+        candidates.sort(key=lambda item: (-item["score"], item["id"]))
+        if model and not literal_lookup and not phrases:
+            self._rerank_candidates(model, topic, candidates, floor)
+        ranked = {}
+        for result in sorted(candidates, key=lambda item: (-item["score"], item["id"])):
+            if result.pop("eligible") and result["id"] not in ranked:
+                result["excerpt"] = excerpt_for(result["excerpt"], query_terms)
+                ranked[result["id"]] = result
+                if len(ranked) == top_k:
+                    break
+        return list(ranked.values())
+
+    @staticmethod
+    def _rerank_candidates(model, query, candidates, floor):
+        # Reserve room for other sources when one file has many matching passages.
+        first = {}
+        second = {}
+        for item in candidates:
+            source_id = item["id"]
+            if source_id in first:
+                second.setdefault(source_id, item)
+            else:
+                first[source_id] = item
+        pool = (list(first.values()) + list(second.values()))[:24]
+        if not pool or (len(pool) == 1 and pool[0]["eligible"]):
+            return
+        pairs = [f"{item['title'][:100]}\n{item['excerpt']}" for item in pool]
+        scores = model.rerank(query, pairs)
+        if scores is None:
+            return
+        for item, logit in zip(pool, scores, strict=True):
+            # Negative logits retain ordering evidence for questions about short passages.
+            item["score"] += 0.32 * max(0.0, min(1.0, (logit + 10.0) / 10.0))
+            if not item["eligible"] and logit >= 1.75 and item["similarity"] >= floor - 0.08:
+                item["eligible"] = True
+                item["match_basis"] = "Passage relevance"
